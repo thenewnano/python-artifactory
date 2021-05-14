@@ -8,7 +8,7 @@ import warnings
 from os.path import isdir, join
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Union, Iterator, overload
-
+import hashlib
 import requests
 from pydantic import parse_obj_as
 
@@ -818,12 +818,45 @@ class ArtifactoryArtifact(ArtifactoryObject):
         else:
             artifact_path = artifact_path.lstrip("/")
             local_filename = artifact_path.split("/")[-1]
-            # we need to silence a bogus mypy error as `file` is already used above
-            # with a different type. See https://github.com/python/mypy/issues/6232
-            with open(local_file_location, "rb") as file:  # type: ignore[assignment]
-                self._put(f"{artifact_path}", data=file)
-                logger.debug("Artifact %s successfully deployed", local_filename)
+            headers = {
+                        "X-Checksum-Deploy": "true",
+                        "X-Checksum-Sha1": self._check_sum("sha1", local_filename),
+                        "X-Checksum-Sha256": self._check_sum("sha256", local_filename),
+                    }
+            try:
+                self._put(f"{artifact_path}", headers=headers)
+            except requests.exceptions.HTTPError as error:
+                if error.response.status_code == 404:
+                    logger.info("Artifact is not on server, content upload is expected in order to deploy the artifact")
+                    headers["X-Checksum-Deploy"] = "false"
+                # we need to silence a bogus mypy error as `file` is already used above
+                # with a different type. See https://github.com/python/mypy/issues/6232
+                    with open(local_file_location, "rb") as file:  # type: ignore[assignment]
+                        self._put(f"{artifact_path}", data=file, headers=headers)
+                        logger.debug("Artifact %s successfully deployed", local_filename)
+                else:
+                    raise ArtifactoryException from error
         return self.info(artifact_path)
+
+    def _check_sum(self, algorithm: str, filename: str) -> str:
+        BLOCKSIZE = 65536
+        hasher = None
+        if algorithm == "md5":
+            hasher = hashlib.md5()
+        elif algorithm == "sha1":
+            hasher = hashlib.sha1()
+        elif algorithm == "sha256":
+            hasher = hashlib.sha256()
+        else:
+            raise Exception("Unsupported hash algorithm - %s", algorithm)
+
+        with open(filename, "rb") as fd:
+            buf = fd.read(BLOCKSIZE)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = fd.read(BLOCKSIZE)
+        return hasher.hexdigest()
+
 
     def _download(self, artifact_path: str, local_directory_path: Path = None) -> Path:
         """
@@ -842,10 +875,16 @@ class ArtifactoryArtifact(ArtifactoryObject):
             local_file_full_path = Path(local_filename)
 
         with self._get(f"{artifact_path}", stream=True) as response:
+            hasher = hashlib.md5()
             with open(local_file_full_path, "wb") as file:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:  # filter out keep-alive new chunks
                         file.write(chunk)
+                        hasher.update(chunk)
+            if hasher.hexdigest() != response.headers['X-Checksum-Md5']:
+                raise ArtifactoryException(f"Checksum missmatch for local file {local_filename} \
+                {hasher.hexdigest()} with Artifactory's {response.headers['X-Checksum-Md5']}")
+
         logger.debug("Artifact %s successfully downloaded", local_filename)
         return local_file_full_path
 
